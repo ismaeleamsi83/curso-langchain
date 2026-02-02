@@ -1,0 +1,122 @@
+from langchain_community.vectorstores import Chroma
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, GoogleGenerativeAI
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+import streamlit as st
+
+from config import *
+from prompts import *
+
+
+@st.cache_resource
+def initialize_rag_system():
+
+    # Vector Store
+    vectorstore = Chroma(
+        embedding_function=GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL),
+        persist_directory=CHROMA_DB_PATH,
+    )
+
+    # Modelos
+    ll_queries = GoogleGenerativeAI(model=QUERY_MODEL, temperature=0)
+    ll_generation = GoogleGenerativeAI(model=GENERATION_MODEL, temperature=0.1)
+
+    # Retriever MMR (Maximal Marginal Relevance)
+    base_retriever = vectorstore.as_retriever(
+        search_type=SEARCH_TYPE,
+        search_kwargs={
+            "k": SEARCH_K,
+            "lambda_mult": MMR_DIVERSITY_LAMBDA,
+            "fetch_k": MMR_FETCH_K,
+        },
+    )
+
+    # Prompt personalizado para MultiQueryRetriever
+    multi_query_prompt = PromptTemplate.from_template(MULTI_QUERY_PROMPT)
+
+    # MultiQueryRetriever con prompt personalizado
+    mmr_multi_retriever = MultiQueryRetriever.from_llm(
+        retriever=base_retriever,
+        llm=ll_queries,
+        prompt=multi_query_prompt,
+    )
+
+    prompt = PromptTemplate.from_template(RAG_TEMPLATE)
+
+    # Funcion para formatear y preprocesar los documentos recuperados
+    def format_docs(docs):
+        formatted = []
+        for i, doc in enumerate(docs, 1):
+            header = f"[Fragmento {i}]"
+
+            if doc.metadata:
+                if "source" in doc.metadata:
+                    source = (
+                        doc.metadata["source"].split("\\")[-1]
+                        if "\\" in doc.metadata["source"]
+                        else doc.metadata["source"]
+                    )
+                    header += f" - Fuente: {source}"
+                if "page" in doc.metadata:
+                    header += f" - Página: {doc.metadata['page']}"
+
+            content = doc.page_content.strip()
+            formatted.append(f"{header}\n{content}")
+
+        return "\n\n".join(formatted)
+
+    rag_chain = (
+        {
+            "context": mmr_multi_retriever | format_docs,
+            "question": RunnablePassthrough(),
+        }
+        | prompt
+        | ll_generation
+        | StrOutputParser()
+    )
+
+    return rag_chain, mmr_multi_retriever
+
+
+def query_rag(question):
+    try:
+        rag_chain, retriever = initialize_rag_system()
+
+        # Obtener la respuesta
+        response = rag_chain.invoke(question)
+
+        # Obtener los documentos para mostrarlos
+        docs = retriever.invoke(question)
+
+        # Formatear los documentos para mostrar
+        docs_info = []
+        for i, doc in enumerate(docs[:SEARCH_K], 1):
+            doc_info = {
+                "fragmento": 1,
+                "contenido": doc.page_content,
+                "metadata": (
+                    doc.metadata[:1000] + "..."
+                    if len(doc.page_content) > 1000
+                    else doc.page_content
+                ),
+                "fuente": doc.metadata.get("source", "No especificado").split("\\")[-1],
+                "pagina": doc.metadata.get("page", "No especificada"),
+            }
+            docs_info.append(doc_info)
+        return response, docs_info
+    except Exception as e:
+        error_msg = f"Error al procesar la consulta: {str(e)}"
+        return error_msg, []
+
+
+def get_retriever_info():
+    """Obtiene información sobre la configuracion del retriever"""
+    return {
+        "tipo": f"{SEARCH_TYPE.upper()}",
+        "documentos": SEARCH_K,
+        "diversidad": MMR_DIVERSITY_LAMBDA,
+        "candidatos": MMR_FETCH_K,
+        "umbral": None,
+    }
